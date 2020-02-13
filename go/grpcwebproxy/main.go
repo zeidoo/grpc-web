@@ -7,6 +7,7 @@ import (
 	"net/http"
 	_ "net/http/pprof" // register in DefaultServerMux
 	"os"
+	"strings"
 	"time"
 
 	"crypto/tls"
@@ -126,7 +127,11 @@ func buildServer(wrappedGrpc *grpcweb.WrappedGrpcServer) *http.Server {
 		WriteTimeout: *flagHttpMaxWriteTimeout,
 		ReadTimeout:  *flagHttpMaxReadTimeout,
 		Handler: http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
-			wrappedGrpc.ServeHTTP(resp, req)
+			if strings.HasPrefix(req.Header.Get("Content-Type"), "application/grpc-web-text") {
+				wrappedGrpc.ServeHTTP(resp, req)
+			} else {
+				http.DefaultServeMux.ServeHTTP(resp, req)
+			}
 		}),
 	}
 }
