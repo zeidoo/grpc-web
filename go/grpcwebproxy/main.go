@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"github.com/zeidoo/grpc-web/go/grpcwebproxy/builders"
 	"google.golang.org/grpc"
 	"net"
 	"net/http"
@@ -68,7 +69,7 @@ func main() {
 		logrus.Fatalf("Both run_http_server and run_tls_server are set to false. At least one must be enabled for grpcweb p to function correctly.")
 	}
 
-	config := &Config{
+	config := &proxybuilder.Config{
 		BindAddress:                     *flagBindAddr,
 		HttpPort:                        *flagHttpPort,
 		HttpTlsPort:                     *flagHttpTlsPort,
@@ -94,7 +95,7 @@ func main() {
 		TlsServerClientCAFiles:          *TlsServerClientCAFiles,
 	}
 
-	proxy := &ProxyBuilder{Config: config}
+	proxy := &proxybuilder.ProxyBuilder{Config: config}
 	errChan := make(chan error)
 
 	httpServer := proxy.GetHttpGrpcServer(logEntry)
