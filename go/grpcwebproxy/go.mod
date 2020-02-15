@@ -1,4 +1,4 @@
-module github.com/zeidoo/grpc-web/grpcwebproxy
+module github.com/zeidoo/grpc-web/go/grpcwebproxy
 
 go 1.13
 
