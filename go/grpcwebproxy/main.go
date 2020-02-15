@@ -2,30 +2,16 @@ package main
 
 import (
 	"fmt"
-	"log"
+	"google.golang.org/grpc"
 	"net"
 	"net/http"
 	_ "net/http/pprof" // register in DefaultServerMux
 	"os"
-	"strings"
 	"time"
 
-	"crypto/tls"
-
-	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
-	grpc_logrus "github.com/grpc-ecosystem/go-grpc-middleware/logging/logrus"
-	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
-	"github.com/improbable-eng/grpc-web/go/grpcweb"
-	"github.com/mwitkow/go-conntrack"
-	"github.com/mwitkow/grpc-proxy/proxy"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
-	"golang.org/x/net/context"
 	_ "golang.org/x/net/trace" // register in DefaultServerMux
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/grpclog"
-	"google.golang.org/grpc/metadata"
 )
 
 var (
@@ -45,6 +31,22 @@ var (
 
 	flagHttpMaxWriteTimeout = pflag.Duration("server_http_max_write_timeout", 10*time.Second, "HTTP server config, max write duration.")
 	flagHttpMaxReadTimeout  = pflag.Duration("server_http_max_read_timeout", 10*time.Second, "HTTP server config, max read duration.")
+
+	flagBackendHostPort      = pflag.String("backend_addr", "", "A host:port (IP or hostname) of the gRPC server to forward it to.")
+	flagBackendIsUsingTls    = pflag.Bool("backend_tls", false, "Whether the gRPC server of the backend is serving in plaintext (false) or over TLS (true).")
+	flagBackendTlsNoVerify   = pflag.Bool("backend_tls_noverify", false, "Whether to ignore TLS verification checks (cert validity, hostname). *DO NOT USE IN PRODUCTION*.")
+	flagBackendTlsClientCert = pflag.String("backend_client_tls_cert_file", "", "Path to the PEM certificate used when the backend requires client certificates for TLS.")
+	flagBackendTlsClientKey  = pflag.String("backend_client_tls_key_file", "", "Path to the PEM key used when the backend requires client certificates for TLS.")
+	// The current maximum receive msg size per https://github.com/grpc/grpc-go/blob/v1.8.2/server.go#L54
+	flagMaxCallRecvMsgSize      = pflag.Int("backend_max_call_recv_msg_size", 1024*1024*4, "Maximum receive message size limit. If not specified, the default of 4MB will be used.")
+	flagBackendTlsCa            = pflag.StringSlice("backend_tls_ca_files", []string{}, "Paths (comma separated) to PEM certificate chains used for verification of backend certificates. If empty, host CA chain will be used.")
+	flagBackendDefaultAuthority = pflag.String("backend_default_authority", "", "Default value to use for the HTTP/2 :authority header commonly used for routing gRPC calls through a backend gateway.")
+	flagBackendBackoffMaxDelay  = pflag.Duration("backend_backoff_max_delay", grpc.DefaultBackoffConfig.MaxDelay, "Maximum delay when backing off after failed connection attempts to the backend.")
+
+	TlsServerCert                   = pflag.String("server_tls_cert_file", "", "Path to the PEM certificate for server use.")
+	TlsServerKey                    = pflag.String("server_tls_key_file", "../misc/localhost.key", "Path to the PEM key for the certificate for the server use.")
+	TlsServerClientCertVerification = pflag.String("server_tls_client_cert_verification", "none", "Controls whether a client certificate is on. Values: none, verify_if_given, require.")
+	TlsServerClientCAFiles          = pflag.StringSlice("server_tls_client_ca_files", []string{}, "Paths (comma separated) to PEM certificate chains used for client-side verification. If empty, host CA chain will be used.")
 )
 
 func main() {
@@ -62,177 +64,59 @@ func main() {
 	if *flagAllowAllOrigins && len(*flagAllowedOrigins) != 0 {
 		logrus.Fatal("Ambiguous --allow_all_origins and --allow_origins configuration. Either set --allow_all_origins=true OR specify one or more origins to whitelist with --allow_origins, not both.")
 	}
+	if !*runHttpServer && !*runTlsServer {
+		logrus.Fatalf("Both run_http_server and run_tls_server are set to false. At least one must be enabled for grpcweb p to function correctly.")
+	}
 
-	grpcServer := buildGrpcProxyServer(logEntry)
+	config := &Config{
+		BindAddress:                     *flagBindAddr,
+		HttpPort:                        *flagHttpPort,
+		HttpTlsPort:                     *flagHttpTlsPort,
+		AllowAllOrigins:                 *flagAllowAllOrigins,
+		AllowedOrigins:                  *flagAllowedOrigins,
+		AllowedHeaders:                  *flagAllowedHeaders,
+		UseWebSockets:                   *useWebsockets,
+		WebSocketPingInterval:           *websocketPingInterval,
+		HttpMaxWriteTimeout:             *flagHttpMaxWriteTimeout,
+		HttpMaxReadTimeout:              *flagHttpMaxReadTimeout,
+		BackendHostPort:                 *flagBackendHostPort,
+		BackendIsUsingTls:               *flagBackendIsUsingTls,
+		BackendTlsNoVerify:              *flagBackendTlsNoVerify,
+		BackendTlsClientCert:            *flagBackendTlsClientCert,
+		BackendTlsClientKey:             *flagBackendTlsClientKey,
+		BackendMaxCallRecvMsgSize:       *flagMaxCallRecvMsgSize,
+		BackendTlsCa:                    *flagBackendTlsCa,
+		BackendDefaultAuthority:         *flagBackendDefaultAuthority,
+		BackendBackoffMaxDelay:          *flagBackendBackoffMaxDelay,
+		TlsServerCert:                   *TlsServerCert,
+		TlsServerKey:                    *TlsServerKey,
+		TlsServerClientCertVerification: *TlsServerClientCertVerification,
+		TlsServerClientCAFiles:          *TlsServerClientCAFiles,
+	}
+
+	proxy := &ProxyBuilder{Config: config}
 	errChan := make(chan error)
 
-	allowedOrigins := makeAllowedOrigins(*flagAllowedOrigins)
-
-	options := []grpcweb.Option{
-		grpcweb.WithCorsForRegisteredEndpointsOnly(false),
-		grpcweb.WithOriginFunc(makeHttpOriginFunc(allowedOrigins)),
-	}
-
-	if *useWebsockets {
-		logrus.Println("using websockets")
-		options = append(
-			options,
-			grpcweb.WithWebsockets(true),
-			grpcweb.WithWebsocketOriginFunc(makeWebsocketOriginFunc(allowedOrigins)),
-		)
-		if *websocketPingInterval >= time.Second {
-			logrus.Infof("websocket keepalive pinging enabled, the timeout interval is %s", websocketPingInterval.String())
-		}
-		options = append(
-			options,
-			grpcweb.WithWebsocketPingInterval(*websocketPingInterval),
-		)
-	}
-
-	if len(*flagAllowedHeaders) > 0 {
-		options = append(
-			options,
-			grpcweb.WithAllowedRequestHeaders(*flagAllowedHeaders),
-		)
-	}
-
-	wrappedGrpc := grpcweb.WrapServer(grpcServer, options...)
-
-	if !*runHttpServer && !*runTlsServer {
-		logrus.Fatalf("Both run_http_server and run_tls_server are set to false. At least one must be enabled for grpcweb proxy to function correctly.")
-	}
-
+	httpServer := proxy.GetHttpGrpcServer(logEntry)
 	if *runHttpServer {
-		// Debug server.
-		debugServer := buildServer(wrappedGrpc)
-		http.Handle("/metrics", promhttp.Handler())
-		debugListener := buildListenerOrFail("http", *flagHttpPort)
-		serveServer(debugServer, debugListener, "http", errChan)
+		srv, lis := proxy.ConfigureHttpServer(httpServer)
+		ServeServer(srv, lis, "http", errChan)
 	}
 
 	if *runTlsServer {
-		// Debug server.
-		servingServer := buildServer(wrappedGrpc)
-		servingListener := buildListenerOrFail("http", *flagHttpTlsPort)
-		servingListener = tls.NewListener(servingListener, buildServerTlsOrFail())
-		serveServer(servingServer, servingListener, "http_tls", errChan)
+		srv, lis := proxy.ConfigureTlsServer(httpServer)
+		ServeServer(srv, lis, "http_tls", errChan)
 	}
 
 	<-errChan
 	// TODO(mwitkow): Add graceful shutdown.
 }
 
-func buildServer(wrappedGrpc *grpcweb.WrappedGrpcServer) *http.Server {
-	return &http.Server{
-		WriteTimeout: *flagHttpMaxWriteTimeout,
-		ReadTimeout:  *flagHttpMaxReadTimeout,
-		Handler: http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
-			if strings.HasPrefix(req.Header.Get("Content-Type"), "application/grpc-web-text") {
-				wrappedGrpc.ServeHTTP(resp, req)
-			} else {
-				http.DefaultServeMux.ServeHTTP(resp, req)
-			}
-		}),
-	}
-}
-
-func serveServer(server *http.Server, listener net.Listener, name string, errChan chan error) {
+func ServeServer(server *http.Server, listener net.Listener, name string, errChan chan error) {
 	go func() {
 		logrus.Infof("listening for %s on: %v", name, listener.Addr().String())
 		if err := server.Serve(listener); err != nil {
 			errChan <- fmt.Errorf("%s server error: %v", name, err)
 		}
 	}()
-}
-
-func buildGrpcProxyServer(logger *logrus.Entry) *grpc.Server {
-	// gRPC-wide changes.
-	grpc.EnableTracing = true
-	grpc_logrus.ReplaceGrpcLogger(logger)
-
-	// gRPC proxy logic.
-	backendConn := dialBackendOrFail()
-	director := func(ctx context.Context, fullMethodName string) (context.Context, *grpc.ClientConn, error) {
-		md, _ := metadata.FromIncomingContext(ctx)
-		outCtx, _ := context.WithCancel(ctx)
-		mdCopy := md.Copy()
-		delete(mdCopy, "user-agent")
-		// If this header is present in the request from the web client,
-		// the actual connection to the backend will not be established.
-		// https://github.com/improbable-eng/grpc-web/issues/568
-		delete(mdCopy, "connection")
-		outCtx = metadata.NewOutgoingContext(outCtx, mdCopy)
-		return outCtx, backendConn, nil
-	}
-	// Server with logging and monitoring enabled.
-	return grpc.NewServer(
-		grpc.CustomCodec(proxy.Codec()), // needed for proxy to function.
-		grpc.UnknownServiceHandler(proxy.TransparentHandler(director)),
-		grpc_middleware.WithUnaryServerChain(
-			grpc_logrus.UnaryServerInterceptor(logger),
-			grpc_prometheus.UnaryServerInterceptor,
-		),
-		grpc_middleware.WithStreamServerChain(
-			grpc_logrus.StreamServerInterceptor(logger),
-			grpc_prometheus.StreamServerInterceptor,
-		),
-	)
-}
-
-func buildListenerOrFail(name string, port int) net.Listener {
-	addr := fmt.Sprintf("%s:%d", *flagBindAddr, port)
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		log.Fatalf("failed listening for '%v' on %v: %v", name, port, err)
-	}
-	return conntrack.NewListener(listener,
-		conntrack.TrackWithName(name),
-		conntrack.TrackWithTcpKeepAlive(20*time.Second),
-		conntrack.TrackWithTracing(),
-	)
-}
-
-func makeHttpOriginFunc(allowedOrigins *allowedOrigins) func(origin string) bool {
-	if *flagAllowAllOrigins {
-		return func(origin string) bool {
-			return true
-		}
-	}
-	return allowedOrigins.IsAllowed
-}
-
-func makeWebsocketOriginFunc(allowedOrigins *allowedOrigins) func(req *http.Request) bool {
-	if *flagAllowAllOrigins {
-		return func(req *http.Request) bool {
-			return true
-		}
-	} else {
-		return func(req *http.Request) bool {
-			origin, err := grpcweb.WebsocketRequestOrigin(req)
-			if err != nil {
-				grpclog.Warning(err)
-				return false
-			}
-			return allowedOrigins.IsAllowed(origin)
-		}
-	}
-}
-
-func makeAllowedOrigins(origins []string) *allowedOrigins {
-	o := map[string]struct{}{}
-	for _, allowedOrigin := range origins {
-		o[allowedOrigin] = struct{}{}
-	}
-	return &allowedOrigins{
-		origins: o,
-	}
-}
-
-type allowedOrigins struct {
-	origins map[string]struct{}
-}
-
-func (a *allowedOrigins) IsAllowed(origin string) bool {
-	_, ok := a.origins[origin]
-	return ok
 }
